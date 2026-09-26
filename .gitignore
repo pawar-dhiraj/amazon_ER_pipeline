@@ -1,0 +1,40 @@
+# Dataset
+dataset/
+
+# Python virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Environment / secrets
+.env
+.env.*
+
+# ML models / large binaries
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+*.bin
+
+# Caches
+.cache/
+huggingface/
+transformers/
+
+# Generated outputs
+matching_results.tsv
+candidate_pairs.tsv
+*.log
