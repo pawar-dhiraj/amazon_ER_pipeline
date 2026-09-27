@@ -50,6 +50,7 @@ import os
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+from scipy.sparse import vstack
 from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.neighbors import NearestNeighbors
 
@@ -77,6 +78,7 @@ except ImportError:
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
 
 HASH_N_FEATURES = 2 ** 18  # fixed, constant memory regardless of corpus size
+HASH_TRANSFORM_BATCH_SIZE = 200_000  # rows per HashingVectorizer.transform() call -- see _batched_hashing_transform
 PREFIX_KEY_LEN = 2  # chars of name_norm used for partitioning
 ADDRESS_KEY_LEN = 3  # chars of address_norm ALSO used -- see _partition_key for why
 MAX_PARTITION_SIZE = 5000  # hard cap -- see _cap_oversized_partitions
@@ -129,6 +131,24 @@ def _encode(model, texts, encode_batch_size, n_jobs, device="cpu"):
 
 def _combined_text(df):
     return (df["name_norm"].fillna("") + " " + df["address_norm"].fillna("")).values
+
+
+def _batched_hashing_transform(vectorizer, texts, batch_size=HASH_TRANSFORM_BATCH_SIZE):
+    """HashingVectorizer.transform() estimates a single nnz buffer for the
+    ENTIRE input it's given in one call, and on a multi-million-row corpus
+    with char_wb n-grams that estimate can blow past available RAM (seen:
+    an 8GB single-allocation failure transforming an unbatched S2/S3
+    corpus). Chunking keeps each call's internal buffer bounded regardless
+    of total corpus size -- the result is identical to one big transform,
+    just built incrementally."""
+    texts = np.asarray(texts)
+    if len(texts) <= batch_size:
+        return vectorizer.transform(texts)
+    chunks = [
+        vectorizer.transform(texts[start:start + batch_size])
+        for start in range(0, len(texts), batch_size)
+    ]
+    return vstack(chunks, format="csr")
 
 
 def _partition_key(df):
@@ -196,12 +216,15 @@ def _search_one_partition(pkey, s1_positions, cand_groups_positions, vec_s1_all,
 # Hashing blocker: build once, query many times
 # --------------------------------------------------------------------------
 
-def build_hashing_index(df_candidates, n_features=HASH_N_FEATURES) -> dict:
+def build_hashing_index(df_candidates, n_features=HASH_N_FEATURES,
+                         transform_batch_size=HASH_TRANSFORM_BATCH_SIZE) -> dict:
     """Vectorizes df_candidates ONCE (stateless HashingVectorizer, no
     vocabulary dict) and partitions it by the blocking key ONCE.
     Returns a bundle to pass into query_hashing_index() as many times
     as you like (e.g. fit split, then val split) without repeating
-    this work."""
+    this work. Transforms in bounded batches (see
+    _batched_hashing_transform) so this is safe to call directly on a
+    full multi-million-row S2/S3 corpus."""
     if len(df_candidates) == 0:
         return None
 
@@ -210,7 +233,9 @@ def build_hashing_index(df_candidates, n_features=HASH_N_FEATURES) -> dict:
         analyzer="char_wb", ngram_range=(2, 4),
         n_features=n_features, alternate_sign=False, norm="l2",
     )
-    vec_cand_all = vectorizer.transform(_combined_text(df_candidates))
+    vec_cand_all = _batched_hashing_transform(
+        vectorizer, _combined_text(df_candidates), batch_size=transform_batch_size
+    )
     cand_ids_all = df_candidates["entity_id"].values
     cand_groups_positions = df_candidates.groupby("_pkey").indices
     cand_groups_positions = _cap_oversized_partitions(cand_groups_positions, MAX_PARTITION_SIZE)
@@ -223,7 +248,8 @@ def build_hashing_index(df_candidates, n_features=HASH_N_FEATURES) -> dict:
     }
 
 
-def query_hashing_index(bundle, df_s1, top_k=15, n_jobs=-1, verbose_partition_stats=True) -> dict:
+def query_hashing_index(bundle, df_s1, top_k=15, n_jobs=-1, verbose_partition_stats=True,
+                         transform_batch_size=HASH_TRANSFORM_BATCH_SIZE) -> dict:
     """Cheap half: vectorize just df_s1 (small), then run the
     lightweight slice+NN step per partition in parallel via
     threading. Safe to call repeatedly against the same bundle."""
@@ -231,7 +257,9 @@ def query_hashing_index(bundle, df_s1, top_k=15, n_jobs=-1, verbose_partition_st
         return defaultdict(set)
 
     df_s1 = df_s1.assign(_pkey=_partition_key(df_s1)).reset_index(drop=True)
-    vec_s1_all = bundle["vectorizer"].transform(_combined_text(df_s1))
+    vec_s1_all = _batched_hashing_transform(
+        bundle["vectorizer"], _combined_text(df_s1), batch_size=transform_batch_size
+    )
     s1_ids_all = df_s1["entity_id"].values
     s1_groups_positions = df_s1.groupby("_pkey").indices
 
@@ -315,14 +343,14 @@ def build_embedding_index(df_candidates, model=None, model_name=EMBEDDING_MODEL_
             ids = np.load(ids_path, allow_pickle=True)
             model = model or SentenceTransformer(model_name, device=device)
             return {"index": index, "ids": ids, "model": model, "model_name": model_name,
-                    "device": device, "dim": model.get_sentence_embedding_dimension()}
+                    "device": device, "dim": getattr(model, "get_embedding_dimension", model.get_sentence_embedding_dimension)()}
 
     print(f"[blocking] building FAISS index over {len(df_candidates)} rows "
           f"(device={device}, batch_size={encode_batch_size})")
     model = model or SentenceTransformer(model_name, device=device)
     texts_cand = list(_combined_text(df_candidates))
     cand_ids = df_candidates["entity_id"].values
-    dim = model.get_sentence_embedding_dimension()
+    dim = getattr(model, "get_embedding_dimension", model.get_sentence_embedding_dimension)()
 
     nlist = _dynamic_nlist(len(texts_cand))
     m_pq = 32 if dim % 32 == 0 else 16  # sub-quantizer count must divide dim evenly
@@ -332,9 +360,14 @@ def build_embedding_index(df_candidates, model=None, model_name=EMBEDDING_MODEL_
     index = faiss.IndexIVFPQ(quantizer, dim, nlist, m_pq, nbits, faiss.METRIC_INNER_PRODUCT)
 
     # --- Train on a bounded sample, never the full corpus ---
+    # FAISS recommends ~40 training points per IVF cell -- bump the
+    # sample size up to cover the nlist we actually chose (avoids the
+    # "please provide at least N training points" warning and the
+    # weaker index quality that comes with under-training).
+    min_train_points = 40 * nlist
+    effective_train_size = min(len(texts_cand), max(train_sample_size, min_train_points))
     rng = np.random.RandomState(0)
-    sample_idx = rng.choice(len(texts_cand), size=min(train_sample_size, len(texts_cand)),
-                             replace=False)
+    sample_idx = rng.choice(len(texts_cand), size=effective_train_size, replace=False)
     train_texts = [texts_cand[i] for i in sample_idx]
     train_emb = _encode(model, train_texts, encode_batch_size, resolved_n_jobs, device)
     index.train(np.asarray(train_emb, dtype="float32"))
