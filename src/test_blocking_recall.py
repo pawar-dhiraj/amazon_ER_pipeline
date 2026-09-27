@@ -1,6 +1,17 @@
 """
 Run: python -m src.test_blocking_recall [--n-s1 20000] [--top-k 15]
                                           [--no-embedding-blocking] [--n-jobs -1]
+                                          [--device cuda]
+
+Benchmark tip (per PIPELINE_HOWTO): run this with --top-k 5, 10, 15,
+20, 30 to compare runtime / candidate count / recall before settling
+on a value for the full pipeline run, e.g.:
+    for k in 5 10 15 20 30; do
+        python -m src.test_blocking_recall --n-s1 5000 --top-k $k
+    done
+Also compare --no-embedding-blocking (hashing-only, fast) against the
+default (hashing + FAISS embeddings) to see how much recall the
+embedding blocker is actually buying you for the extra time.
 
 Checks Step 2 (src/blocking.py) recall against the TRAIN ground truth
 on a configurable-size sample -- NOT the full 13.8M rows. This is the
@@ -36,6 +47,9 @@ def main():
     parser.add_argument("--no-embedding-blocking", action="store_true")
     parser.add_argument("--n-jobs", type=int, default=-1)
     parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument("--device", default=None, choices=["cuda", "cpu"],
+                         help="Device for the sentence-embedding model. Default: "
+                              "auto-detect CUDA if available, else CPU.")
     args = parser.parse_args()
 
     print("Loading datasets...")
@@ -62,7 +76,7 @@ def main():
     candidates = blocking.generate_candidates(
         s1c, s2c, s3c, top_k=args.top_k,
         use_embedding_blocking=not args.no_embedding_blocking,
-        n_jobs=args.n_jobs,
+        n_jobs=args.n_jobs, device=args.device,
     )
     elapsed = time.time() - start
     print(f"done in {elapsed:.1f}s ({elapsed / max(len(s1c), 1):.4f}s per S1 entity)")
